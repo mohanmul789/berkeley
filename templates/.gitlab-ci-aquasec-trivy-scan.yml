@@ -1,0 +1,56 @@
+include:
+  # Credentials to Nexus repo
+  - local: "/templates/vars/.gitlab-ci-sonatype-vars.yml"
+  # Check variables
+  - local: "/templates/.gitlab-ci-common.yml"
+
+variables:
+  TRIVY_VERSION: latest
+  REPORT_NAME: "trivy-scan-report"
+  TRIVY_SBOM_FILE: ""
+
+# -----
+# Include these variables in your .gitlab-ci.yml
+# i.e.
+# variables:
+#   SCAN_TARGET: $NEXUSREPO_DOCKER_HOSTED_HOSTNAME/ship-test/gradle:latest
+#   REPORT_LEVELS: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL # comma separated values without whitespace in-between - possible values: UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL
+#   FAIL_LEVELS: UNKNOWN # fail stage on detection of specified levels of vulnerability
+#   REPORT_NAME: trivy-scan-report
+#   TRIVY_VERSION: latest # (Optional) default to "latest"
+#   TRIVY_SBOM_FILE: trivy.cdx.json # (Optional)
+
+.trivy-scan:
+  image:
+    name: $NEXUSREPO_DOCKER_PROXY_HOSTNAME/aquasec/trivy:$TRIVY_VERSION
+    entrypoint: [""]
+  # tags:
+  #   - non_privileged
+  #   - no_root
+  #   - cstack
+  script:
+    - export VARIABLE_NAME=SCAN_TARGET
+    - !reference [.check-variable-sh, script]
+    - export VARIABLE_NAME=REPORT_LEVELS
+    - !reference [.check-variable-sh, script]
+    - export VARIABLE_NAME=FAIL_LEVELS
+    - !reference [.check-variable-sh, script]
+    # Decides command to scan based on SCAN_TARGET (image from registry URL or .tar or .tar.gz format)
+    - |
+      OPTS=$SCAN_TARGET
+      if [[ "$SCAN_TARGET" == *.tar ]] || [[ "$SCAN_TARGET" == *.tar.gz ]]
+      then
+          OPTS="--input $SCAN_TARGET"
+      fi
+      trivy image --severity $REPORT_LEVELS --exit-code 0 --format template --template "@/contrib/gitlab.tpl" --output $REPORT_NAME.json $OPTS
+      if [ -n "$TRIVY_SBOM_FILE" ]; then
+          trivy image --format cyclonedx --output $TRIVY_SBOM_FILE $OPTS
+      fi
+      trivy image --severity $FAIL_LEVELS --exit-code 1 $OPTS
+  artifacts:
+    # If a custom name for the trivy scan report is needed
+    when: always
+    name: $REPORT_NAME
+    paths:
+      - $REPORT_NAME.json
+      - $TRIVY_SBOM_FILE

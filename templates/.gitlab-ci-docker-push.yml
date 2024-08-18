@@ -1,0 +1,38 @@
+include:
+  - local: "/templates/.gitlab-ci-common.yml"
+  - local: "/templates/vars/.gitlab-ci-pipeline-coe-vars.yml"
+
+# -----
+# Include these variables in your .gitlab-ci.yml 
+# i.e.
+# variables:
+#   DOCKER_TARGET_REGISTRY: $AWS_ECR_URL
+#   DOCKER_TARGET_IMAGE: "kaniko-debug-image:latest"
+#   TAR_PATH: "./source.tar"
+
+# Project CI/CD variables to pass in: 
+#   DOCKER_USER: "AWS"
+#   DOCKER_PASSWORD: $AWS_ECR_TOKEN
+
+.push-docker-image-to-private-registry:
+  image:
+    name: $PIPELINE_COE_REGISTRY/crane-container:latest
+  # tags:
+  #   - non_privileged
+  #   - no_root
+  #   - cstack
+  before_script:
+    - export VARIABLE_NAME=DOCKER_TARGET_REGISTRY
+    - !reference [.check-variable-sh, script]
+    - export VARIABLE_NAME=DOCKER_TARGET_IMAGE
+    - !reference [.check-variable-sh, script]
+    - export VARIABLE_NAME=TAR_PATH
+    - !reference [.check-variable-sh, script]
+    - !reference [.check-docker-auth-config-sh, script]
+  after_script:
+    # Pending Workaround: Job status will be 'passed' even if after_script failed
+    - crane push $TAR_PATH $DOCKER_TARGET_REGISTRY/$DOCKER_TARGET_IMAGE
+    - |
+      if [ -f "~/.docker/config.json" ]; then
+        echo "" > ~/.docker/config.json  # logout
+      fi

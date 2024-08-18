@@ -1,0 +1,5 @@
+variables:
+  GITLAB_HOSTNAME: "sgts.gitlab-dedicated.com"
+  TEMPLATE_REF_MSG: "See https://$GITLAB_HOSTNAME/WOG/GVT/ship/ship-hats-templates/-/blob/main/templates/README.md for more details."
+  SONARQUBE_COMMUNITY_URL: "https://sonar.hats.stack.gov.sg/sonar"
+  SONARQUBE_DEVELOPER_URL: "https://sonar1.hats.stack.gov.sg/sonar"

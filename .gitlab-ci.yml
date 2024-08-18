@@ -1,0 +1,520 @@
+image:
+  name: registry.gitlab.com/rvasuki84/berkeley:latest
+
+include:
+  - local: "/templates/.gitlab-ci-aquasec-trivy-scan.yml"
+  - local: "/templates/vars/.gitlab-ci-pipeline-coe-vars.yml"
+  - local: '/templates/.gitlab-ci-aws.yml'
+  - local: '/templates/.gitlab-ci-docker-build.yml'
+  - local: '/templates/.gitlab-ci-checkov-scan.yml'
+  - template: Jobs/SAST-IaC.gitlab-ci.yml
+
+stages:
+  - .pre
+  - build
+  - scan
+  - deploy
+  - terraform plan
+  - checkov scan
+  - terraform apply
+
+
+variables:
+  WORKING_DIR: .
+  DOCKER_REGISTRY: $CI_REGISTRY_IMAGE
+  IMAGE_NAME: node-image
+  IMAGE_VERSION: $CI_COMMIT_SHORT_SHA
+  DOCKER_USER: $CI_REGISTRY_USER
+  DOCKER_PASSWORD: $CI_REGISTRY_PASSWORD
+  DOCKER_TARGET_IMAGE: $IMAGE_NAME:$IMAGE_VERSION
+  SBOM_FILE: trivy.cdx.json
+
+iac-sast:
+  stage: .pre
+
+.invoke-awscli-commands-with-assumerole:
+  image:
+    name: registry.gitlab.com/rvasuki84/berkeley:latest
+    entrypoint:
+      - '/usr/bin/env'
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://$CI_SERVER_HOST
+
+  before_script:
+    - export VARIABLE_NAME=ROLE_ARN
+    - !reference [.check-variable-sh, script]
+    - |
+      STS=($(aws sts assume-role-with-web-identity \
+      --role-arn ${ROLE_ARN} \
+      --role-session-name "Ship-Devops-${CI_PIPELINE_ID}-${CI_JOB_ID}-Session" \
+      --web-identity-token ${GITLAB_OIDC_TOKEN} \
+      --duration-seconds 3600 \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+      --output text))
+      export AWS_ACCESS_KEY_ID="${STS[0]}"
+      export AWS_SECRET_ACCESS_KEY="${STS[1]}"
+      export AWS_SESSION_TOKEN="${STS[2]}"
+  after_script:
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+.terraform_template:
+  extends:
+    - .invoke-awscli-commands-with-assumerole
+  image: registry.gitlab.com/rvasuki84/berkeley:latest
+  variables:
+    ROLE_ARN: ${ROLE_ARN}
+  before_script:
+    - echo $READ_TOKEN > ~/.terraformrc 
+    - !reference [.invoke-awscli-commands-with-assumerole, before_script]
+    - LOCATION=$(echo ${CI_JOB_NAME} | cut -d":" -f3)
+    - cd ${LOCATION}
+    - pwd
+    - terraform init -backend-config="$environment_var"-backend.tfvars -reconfigure
+    - terraform workspace select "$environment_var"
+    - terraform output -json
+
+  after_script:
+    - !reference [.invoke-awscli-commands-with-assumerole, after_script]
+    - rm ~/.terraformrc
+
+.terraform_plan_template:
+  stage: terraform plan
+  extends: .terraform_template
+  script:
+    - pwd
+    - terraform plan -var-file="$environment_var".tfvars -out="$environment_var"-tfplan
+    - terraform show -json $environment_var-tfplan | jq '.' > $environment_var-tfplan.json
+
+.terraform_apply_template:
+  stage: terraform apply
+  extends: .terraform_template
+  script:
+    - pwd
+    - terraform apply "$environment_var"-tfplan
+
+.checkov-scan-template:
+  extends: .checkov-scan
+  stage: checkov scan
+  variables:
+    OPTS: "-f $environment_var-tfplan.json --check $CHECKOV_IDS"
+  before_script:
+    - LOCATION=$(echo ${CI_JOB_NAME} | cut -d":" -f3)
+    - cd terraform/${LOCATION}
+    - pwd
+    - |
+      CHECK=`echo $OPTS | awk -F"--check" '{print $2}' | awk -F" " '{print $1}'`
+      SKIP_CHECK=`echo $OPTS | awk -F"--skip-check" '{print $2}' | awk -F" " '{print $1}'`
+      if [ ! -z $SKIP_CHECK ]
+      then
+        CHECKOV_IDS=$(echo $CHECK | sed "s/$SKIP_CHECK//g")
+      fi
+      OPTS="-f $environment_var-tfplan.json --check $CHECKOV_IDS"
+  after_script:
+    - LOCATION=$(echo ${CI_JOB_NAME} | cut -d":" -f3)
+    - cp terraform/${LOCATION}/checkov_results.xml /tmp/$CI_PROJECT_PATH
+  allow_failure: false
+
+
+##################### vpc folder ###########################
+
+dev:terraform-pre-plan:vpc:
+  stage: .pre
+  extends: .terraform_plan_template
+  variables:
+    environment_var: dev
+    ROLE_ARN : ${ROLE_ARN}
+  environment: dev
+  artifacts:
+    paths:
+    - vpc/dev-tfplan*
+    expire_in: 20 minutes
+  # rules:
+  #   - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != "main"'
+  #     changes:
+  #       paths:
+  #         - terraform/vpc/*
+  #       compare_to: 'refs/heads/main'
+  #     allow_failure: true
+
+dev:terraform-plan:vpc:
+  stage: build
+  extends: .terraform_plan_template
+  variables:
+    environment_var: dev
+    ROLE_ARN : ${ROLE_ARN}
+  environment: dev
+  artifacts:
+    paths:
+    - vpc/dev-tfplan*
+    expire_in: 20 minutes
+  only:
+    changes:
+    - /vpc/*
+
+dev:terraform-plan:vpc:checkov-scan:
+  stage: scan
+  extends: .checkov-scan-template
+  variables:
+    environment_var: dev
+    OPTS: "-f $environment_var-tfplan.json --check $CHECKOV_IDS --skip-check CKV2_AWS_11,CKV2_AWS_12"
+  needs:
+  - job: dev:terraform-plan:vpc
+    artifacts: true
+  only:
+   changes:
+    - /vpc/*
+
+dev:terraform-apply:vpc:
+  stage: deploy
+  extends: .terraform_apply_template
+  variables:
+    environment_var: dev
+    ROLE_ARN : ${ROLE_ARN}
+  environment: dev
+  needs:
+  - job: dev:terraform-plan:vpc
+    artifacts: true
+  - job: dev:terraform-plan:vpc:checkov-scan
+  when: manual
+  only:
+      changes:
+      - /vpc/*
+
+test:terraform-pre-plan:vpc:
+  stage: .pre
+  extends: .terraform_plan_template
+  variables:
+    environment_var: test
+    ROLE_ARN : ${ROLE_ARN}
+  environment: test
+  artifacts:
+    paths:
+    - vpc/test-tfplan*
+    expire_in: 20 minutes
+  # rules:
+  #   - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != "main"'
+  #     changes:
+  #       paths:
+  #         - terraform/vpc/*
+  #       compare_to: 'refs/heads/main'
+  #     allow_failure: true
+
+test:terraform-plan:vpc:
+  stage: build
+  extends: .terraform_plan_template
+  variables:
+    environment_var: test
+    ROLE_ARN : ${ROLE_ARN}
+  environment: test
+  artifacts:
+    paths:
+    - vpc/test-tfplan*
+    expire_in: 20 minutes
+  only:
+    changes:
+    - /vpc/*
+
+test:terraform-plan:vpc:checkov-scan:
+  stage: scan
+  extends: .checkov-scan-template
+  variables:
+    environment_var: test
+    OPTS: "-f $environment_var-tfplan.json --check $CHECKOV_IDS --skip-check CKV2_AWS_11,CKV2_AWS_12"
+  needs:
+  - job: test:terraform-plan:vpc
+    artifacts: true
+  only:
+   changes:
+    - /vpc/*
+
+test:terraform-apply:vpc:
+  stage: deploy
+  extends: .terraform_apply_template
+  variables:
+    environment_var: test
+    ROLE_ARN : ${ROLE_ARN}
+  environment: test
+  needs:
+  - job: test:terraform-plan:vpc
+    artifacts: true
+  - job: test:terraform-plan:vpc:checkov-scan
+  when: manual
+  only:
+      changes:
+      - /vpc/*
+
+
+#----eks-cluster
+dev:terraform-pre-plan:eks-cluster:
+  stage: .pre
+  extends: .terraform_plan_template
+  variables:
+    environment_var: dev
+    ROLE_ARN : ${ROLE_ARN}
+  environment: dev
+  artifacts:
+    paths:
+    - eks-cluster/dev-tfplan*
+    expire_in: 20 minutes
+  only:
+    changes:
+      - eks-cluster/*
+
+
+dev:terraform-plan:eks-cluster:
+  stage: build
+  extends: .terraform_plan_template
+  variables:
+    environment_var: dev
+    ROLE_ARN : ${ROLE_ARN}
+  environment: dev
+  artifacts:
+    paths:
+    - eks-cluster/dev-tfplan*
+    expire_in: 20 minutes
+  only:
+    changes:
+      - eks-cluster/*
+
+dev:terraform-plan:eks-cluster:checkov-scan:
+  stage: scan
+  extends: .checkov-scan-template
+  variables:
+    environment_var: dev
+    OPTS: "-f $environment_var-tfplan.json --check $CHECKOV_IDS --skip-check CKV2_AWS_11,CKV2_AWS_12"
+  needs:
+  - job: dev:terraform-plan:eks-cluster
+    artifacts: true
+  only:
+    changes:
+      - terraform/eks-cluster/*
+
+dev:terraform-apply:eks-cluster:
+  stage: deploy
+  extends: .terraform_apply_template
+  variables:
+    environment_var: dev
+    ROLE_ARN : ${ROLE_ARN}
+  environment: dev
+  needs:
+  - job: dev:terraform-plan:eks-cluster
+    artifacts: true
+  - job: dev:terraform-plan:eks-cluster:checkov-scan
+  when: manual
+  only:
+    changes:
+      - eks-cluster/*
+
+test:terraform-pre-plan:eks-cluster:
+  stage: .pre
+  extends: .terraform_plan_template
+  variables:
+    environment_var: test
+    ROLE_ARN : ${ROLE_ARN}
+  environment: test
+  artifacts:
+    paths:
+    - eks-cluster/test-tfplan*
+    expire_in: 20 minutes
+  only:
+    changes:
+      - eks-cluster/*
+
+
+test:terraform-plan:eks-cluster:
+  stage: build
+  extends: .terraform_plan_template
+  variables:
+    environment_var: test
+    ROLE_ARN : ${ROLE_ARN}
+  environment: test
+  artifacts:
+    paths:
+    - eks-cluster/test-tfplan*
+    expire_in: 20 minutes
+  only:
+    changes:
+      - eks-cluster/*
+
+test:terraform-plan:eks-cluster:checkov-scan:
+  stage: scan
+  extends: .checkov-scan-template
+  variables:
+    environment_var: test
+    OPTS: "-f $environment_var-tfplan.json --check $CHECKOV_IDS --skip-check CKV2_AWS_11,CKV2_AWS_12"
+  needs:
+  - job: test:terraform-plan:eks-cluster
+    artifacts: true
+  only:
+    changes:
+      - terraform/eks-cluster/*
+
+test:terraform-apply:eks-cluster:
+  stage: deploy
+  extends: .terraform_apply_template
+  variables:
+    environment_var: test
+    ROLE_ARN : ${ROLE_ARN}
+  environment: test
+  needs:
+  - job: test:terraform-plan:eks-cluster
+    artifacts: true
+  - job: test:terraform-plan:eks-cluster:checkov-scan
+  when: manual
+  only:
+    changes:
+      - eks-cluster/*
+
+############### web-npm ##########
+
+
+dev-build-image:
+  stage: build
+  environment: dev
+  extends:
+    - .build-and-push-docker-image
+  variables:
+    DOCKER_TARGET_REGISTRY: $DOCKER_REGISTRY
+    environment_var: dev
+  before_script:
+    - cd web-npm
+
+dev-trivy-scan:
+  stage: scan
+  environment: dev
+  extends:
+    - .trivy-scan
+  variables:
+    SCAN_TARGET: $DOCKER_REGISTRY/$DOCKER_TARGET_IMAGE
+    REPORT_LEVELS: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+    FAIL_LEVELS: CRITICAL
+    TRIVY_USERNAME: $DOCKER_USER
+    TRIVY_PASSWORD: $DOCKER_PASSWORD
+    TRIVY_SBOM_FILE: $SBOM_FILE
+    environment_var: dev
+
+dev-docker-push-to-aws-ecr-job:
+  stage: deploy
+  extends:
+    - .invoke-ecr-token-retrieval  
+  environment: dev
+  image: $PIPELINE_COE_REGISTRY/ecr-container:latest
+  variables:
+    environment_var: dev
+    SRC_USER: $DOCKER_USER
+    SRC_PASSWORD: $DOCKER_PASSWORD
+    DEST_USER: "AWS"
+    SRC_IMAGE: $DOCKER_REGISTRY/$IMAGE_NAME:$IMAGE_VERSION
+    DEST_IMAGE: $AWS_ECR_URL/result:$IMAGE_VERSION
+  before_script:
+    - .invoke-ecr-token-retrieval, before_script
+    - OPTS="--remove-signatures --src-creds $SRC_USER:$SRC_PASSWORD --dest-creds $DEST_USER:$ECR_TOKEN --digestfile $CI_PROJECT_DIR/digest"
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/digest
+    expire_in: 1 week
+  script:
+    - echo "changes in docker file"
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != "main"'
+      changes:
+        paths:
+          - web-npm/*
+        compare_to: 'refs/heads/main'
+      allow_failure: true
+
+
+dev-deploy-k8s-service:
+  extends: .invoke-kubectlupdateconfig
+  stage: deploy
+  variables:
+    environment_var: dev
+    ROLE_ARN : ${ROLE_ARN}
+  environment: dev
+  script:
+    - kubectl apply -f ./eks-cluster/k8s/deployment.yml
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != "main"'
+      changes:
+        paths:
+          - /eks-cluster/k8s/*
+        compare_to: 'refs/heads/main'
+      allow_failure: true
+
+
+test-build-image:
+  stage: build
+  environment: test
+  extends:
+    - .build-and-push-docker-image
+  variables:
+    DOCKER_TARGET_REGISTRY: $DOCKER_REGISTRY
+    environment_var: test
+  before_script:
+    - cd web-npm
+
+test-trivy-scan:
+  stage: scan
+  environment: test
+  extends:
+    - .trivy-scan
+  variables:
+    SCAN_TARGET: $DOCKER_REGISTRY/$DOCKER_TARGET_IMAGE
+    REPORT_LEVELS: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+    FAIL_LEVELS: CRITICAL
+    TRIVY_USERNAME: $DOCKER_USER
+    TRIVY_PASSWORD: $DOCKER_PASSWORD
+    TRIVY_SBOM_FILE: $SBOM_FILE
+    environment_var: test
+
+test-docker-push-to-aws-ecr-job:
+  stage: deploy
+  extends:
+    - .invoke-ecr-token-retrieval
+  environment: test
+  image: $PIPELINE_COE_REGISTRY/ecr-container:latest
+  variables:
+    environment_var: test
+    SRC_USER: $DOCKER_USER
+    SRC_PASSWORD: $DOCKER_PASSWORD
+    DEST_USER: "AWS"
+    SRC_IMAGE: $DOCKER_REGISTRY/$IMAGE_NAME:$IMAGE_VERSION
+    DEST_IMAGE: $AWS_ECR_URL/result:$IMAGE_VERSION
+  before_script:
+    - .invoke-ecr-token-retrieval, before_script
+    - OPTS="--remove-signatures --src-creds $SRC_USER:$SRC_PASSWORD --dest-creds $DEST_USER:$ECR_TOKEN --digestfile $CI_PROJECT_DIR/digest"
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/digest
+    expire_in: 1 week
+  script:
+    - echo "changes in docker file"
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != "main"'
+      changes:
+        paths:
+          - web-npm/*
+        compare_to: 'refs/heads/main'
+      allow_failure: true
+
+
+test-deploy-k8s-service:
+  extends: .invoke-kubectlupdateconfig
+  stage: deploy
+  variables:
+    environment_var: test
+    ROLE_ARN : ${ROLE_ARN}
+  environment: test
+  script:
+    - kubectl apply -f ./eks-cluster/k8s/deployment.yml
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH != "main"'
+      changes:
+        paths:
+          - /eks-cluster/k8s/*
+        compare_to: 'refs/heads/main'
+      allow_failure: true
+

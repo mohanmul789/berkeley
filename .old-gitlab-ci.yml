@@ -1,0 +1,76 @@
+image:
+  name: hashicorp/terraform:light
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    - 'AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}' 
+    - 'AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}' 
+    - 'AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}'
+
+variables:
+  PLAN: plan.tfplan
+
+cache:
+  paths:
+    - .terraform
+
+before_script:
+  - terraform --version
+  - cd eks-cluster
+  - pwd
+  - echo $AWS_ACCESS_KEY_ID
+  - terraform init -backend-config=test-backend.tfvars -reconfigure
+  - terraform workspace new $environment_var
+
+stages:
+  - validate
+  - plan
+  - apply
+  - destroy
+
+validate:
+  stage: validate
+  script:
+    - terraform validate
+  only:
+    - branches
+
+plan:
+  stage: plan
+  variables:
+    ROLE_ARN: ${ROLE_ARN}
+    environment_var: test
+  script:
+    - terraform plan -var-file="$environment_var".tfvars -out="$environment_var"-tfplan
+    - terraform show -json $environment_var-tfplan | jq '.' > $environment_var-tfplan.json
+  artifacts:
+    name: plan
+    paths:
+      - ${TF_ROOT}/plan.cache
+
+build:
+  stage: plan
+  script:
+    - terraform plan -out=$PLAN
+  artifacts:
+    name: plan
+    paths:
+      - $PLAN
+
+apply:
+  stage: apply
+  script:
+    - terraform apply -input=false $PLAN
+  dependencies:
+    - build
+  when: manual
+
+destroy:
+  stage: destroy
+  script:
+    - echo "Destroying resources"
+    - terraform destroy -state=$STATE --auto-approve
+  dependencies:
+    - apply  
+  when: manual
+   

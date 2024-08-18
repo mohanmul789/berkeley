@@ -1,0 +1,6 @@
+variables:
+  NEXUSREPO_HOSTNAME: "nexus.ship.gov.sg"
+  NEXUSREPO_URL: https://$NEXUSREPO_HOSTNAME
+  NEXUSREPO_DOCKER_PROXY_HOSTNAME: "nexus-docker.ship.gov.sg"
+  NEXUSREPO_DOCKER_HOSTED_HOSTNAME: "nexus-docker-publish.ship.gov.sg"
+  NEXUS_IQ_URL: "https://nexus-iq.ship.gov.sg"

@@ -1,0 +1,92 @@
+include:
+  - local: "/templates/.gitlab-ci-common.yml"
+  - local: "/templates/vars/.gitlab-ci-pipeline-coe-vars.yml"
+  - local: "/templates/vars/.gitlab-ci-sonatype-vars.yml"
+
+variables:
+  AWS_DEFAULT_REGION: "ap-southeast-1"
+
+.invoke-awscli-commands-with-assumerole:
+  image:
+    name: $NEXUSREPO_DOCKER_PROXY_HOSTNAME/amazon/aws-cli:latest
+    entrypoint:
+      - '/usr/bin/env'
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://$CI_SERVER_HOST
+  # tags:
+  #   - non_privileged
+  #   - no_root
+  #   - cstack
+  before_script:
+    - export VARIABLE_NAME=ROLE_ARN
+    - !reference [.check-variable-sh, script]
+    - |
+      STS=($(aws sts assume-role-with-web-identity \
+      --role-arn ${ROLE_ARN} \
+      --role-session-name "Ship-Devops-${CI_PIPELINE_ID}-${CI_JOB_ID}-Session" \
+      --web-identity-token ${GITLAB_OIDC_TOKEN} \
+      --duration-seconds 3600 \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+      --output text))
+      export AWS_ACCESS_KEY_ID="${STS[0]}"
+      export AWS_SECRET_ACCESS_KEY="${STS[1]}"
+      export AWS_SESSION_TOKEN="${STS[2]}"
+  after_script:
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+.invoke-awssecretretrieval:
+  image:
+    name: $PIPELINE_COE_REGISTRY/aws-cli-and-kubernetes-container:latest
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://$CI_SERVER_HOST
+  # tags:
+  #   - non_privileged
+  #   - no_root
+  #   - cstack
+  before_script:
+    - export VARIABLE_NAME=SECRET_ID
+    - !reference [.check-variable-sh, script]
+    - !reference [.invoke-awscli-commands-with-assumerole, before_script]
+    - secret="$(aws secretsmanager get-secret-value --secret-id  "$SECRET_ID" --region ap-southeast-1 ) "
+  after_script:
+    - !reference [.invoke-awscli-commands-with-assumerole, after_script]
+
+.invoke-kubectlupdateconfig:
+  image: $PIPELINE_COE_REGISTRY/aws-cli-and-kubernetes-container:latest
+  extends: .invoke-awscli-commands-with-assumerole
+  before_script:
+    - export VARIABLE_NAME=CLUSTER_NAME
+    - !reference [.check-variable-sh, script]
+    - !reference [.invoke-awscli-commands-with-assumerole, before_script]
+    - aws eks update-kubeconfig --name $CLUSTER_NAME --region ap-southeast-1
+  after_script:
+    - !reference [.invoke-awscli-commands-with-assumerole, after_script]
+
+# -----
+
+.invoke-ecr-token-retrieval:
+  image: 
+    name: $NEXUSREPO_DOCKER_PROXY_HOSTNAME/amazon/aws-cli:latest
+    entrypoint:
+      - '/usr/bin/env'
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://$CI_SERVER_HOST
+  # tags:
+  #   - non_privileged
+  #   - no_root
+  #   - cstack
+  before_script:
+    - export VARIABLE_NAME=AWS_ECR_URL
+    - !reference [.check-variable-sh, script]
+    - !reference [.invoke-awscli-commands-with-assumerole, before_script]
+    - export ECR_TOKEN=$(aws ecr get-login-password --region ap-southeast-1)
+  after_script:
+    - !reference [.invoke-awscli-commands-with-assumerole, after_script]
+    - unset ECR_TOKEN
+    - |
+      if [ -f "~/.docker/config.json" ]; then
+        echo "" > ~/.docker/config.json  # logout
+      fi

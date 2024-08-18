@@ -1,0 +1,85 @@
+include:
+  - local: "/templates/vars/.gitlab-ci-general-vars.yml"
+  - local: "/templates/vars/.gitlab-ci-sonatype-vars.yml"
+
+variables:
+  CUSTOM_MSG: $TEMPLATE_REF_MSG
+
+.check-variable-bash: &check-variable-bash
+  script:
+    - if [ -z "${!VARIABLE_NAME}" ]; then echo "$VARIABLE_NAME must be set. $CUSTOM_MSG" && exit 1; fi
+
+.check-variable-sh: &check-variable-sh
+  script:
+    - if [ -z "$(eval echo \$$VARIABLE_NAME)" ]; then echo "$VARIABLE_NAME must be set. $CUSTOM_MSG" && exit 1; fi
+
+.check-read-jq-sh: &check-read-jq-sh
+  script:
+    - if [ -z "$(eval echo \$$VARIABLE_NAME)" ]; then echo "Expected $VARIABLE_NAME but not found in json. Unable to proceed. $CUSTOM_MSG" && exit 1; fi
+
+.check-json-key-has-items: &check-json-key-has-items # in(JSON_KEY, JSON_FILE, FAIL_ON_MISSING_JSON_KEY), out(JSON_KEY_ITEM_COUNT, JSON_KEY_ITEMS)
+  script:
+    - |
+      JSON_KEY_ITEM_COUNT=0
+      if [ $(jq "has(\"$JSON_KEY\")" $JSON_FILE) = "false" ] ; then
+          echo "$JSON_FILE is missing $JSON_KEY key"
+          if [ $FAIL_ON_MISSING_JSON_KEY = 1 ]; then exit 1; fi
+      fi
+      JSON_KEY_ITEM_COUNT=$(jq ".$JSON_KEY | length" $JSON_FILE)
+      JSON_KEY_ITEMS=$(jq ".$JSON_KEY" $JSON_FILE)
+      
+.check-variable-ps: &check-variable-ps
+  script:
+    - if ( $null -eq (Get-Variable $VARIABLE_NAME -ValueOnly 2>$null) ){ echo "$VARIABLE_NAME must be set. $CUSTOM_MSG"; exit 1; }
+
+.git-set-remote: &git-set-remote
+  before_script:
+    - export VARIABLE_NAME=TOKEN
+    - !reference [.check-variable-sh, script]
+    - |
+      if [ -z "$CUSTOM_GITUSER_EMAIL"  ] && [ -z "$CUSTOM_GITUSER_NAME" ]; then
+        CUSTOM_GITUSER_EMAIL=$GITLAB_USER_EMAIL
+        CUSTOM_GITUSER_NAME=$GITLAB_USER_LOGIN
+      fi
+    - git config --global user.email $CUSTOM_GITUSER_EMAIL
+    - git config --global user.name $CUSTOM_GITUSER_NAME
+    - git remote set-url origin https://$CUSTOM_GITUSER_NAME:$TOKEN@${CI_PROJECT_URL:8}  || true # silence output as it prints out the token
+
+.check-docker-auth-config-sh:
+  script:
+    - |
+      if [ -f "$HOME/.docker/config.json" ]; then
+        echo "config.json exists."
+      else
+        mkdir -p $HOME/.docker
+        touch $HOME/.docker/config.json
+        if [ -n "$DOCKER_USER" ] && [ -n "$DOCKER_PASSWORD" ] && [ -n $DOCKER_TARGET_REGISTRY ]; then
+          echo "{\"auths\":{\"$DOCKER_TARGET_REGISTRY\":{\"auth\":\"$(printf "%s:%s" "${DOCKER_USER}" "${DOCKER_PASSWORD}" | base64 | tr -d '\n')\"}}}" > $HOME/.docker/config.json
+        elif [ -n "$DOCKER_AUTH_CONFIG" ]; then
+          echo $DOCKER_AUTH_CONFIG > $HOME/.docker/config.json
+        fi
+      fi
+
+.get-fod-access-bearer-token-sh:
+  variables:
+    FOD_API: https://api.sgp.fortify.com
+    FOD_TENANT: GovTech
+  script:
+    - |
+      echo "===Fetching access token using PAT==="
+
+      curl --fail-with-body --output ${CI_PIPELINE_ID}_oauth.json --show-error --location -X POST "$FOD_API/oauth/token" \
+      --form 'scope="api-tenant"' \
+      --form 'grant_type="password"' \
+      --form "username=\"$FOD_TENANT\\$FOD_USERNAME\"" \
+      --form "password=\"$FOD_PAT\""
+
+      TOKEN=$(cat ${CI_PIPELINE_ID}_oauth.json | jq -r '.access_token')
+      rm ${CI_PIPELINE_ID}_oauth.json
+      
+      echo "===Checking access token validity==="
+      if [[ ! -z "$TOKEN" ]]; then
+        echo "OK"
+      else
+        echo "NO TOKEN" && exit 1
+      fi

@@ -1,0 +1,73 @@
+include:
+  - local: "/templates/.gitlab-ci-common.yml"
+  - local: "/templates/vars/.gitlab-ci-pipeline-coe-vars.yml"
+
+# -----
+# Include these variables in your .gitlab-ci.yml 
+# i.e.
+# variables:
+#   DOCKER_TARGET_REGISTRY: $AWS_ECR_URL
+#   DOCKER_TARGET_IMAGE: "test:latest"
+#   DOCKERFILE_PATH: "./" # (Optional)
+#   DOCKERFILE_CONTEXT: "./" # (Optional)
+#   DOCKERFILE_NAME: "Dockerfile" # (Optional)
+#   DIGESTFILE_NAME: "$CI_PROJECT_DIR/digest" # (Optional)
+#   OPTS: "--tarPath output.tar" # (Optional)
+
+# Project CI/CD variables to pass in: 
+#   DOCKER_USER: "AWS"
+#   DOCKER_PASSWORD: $AWS_ECR_TOKEN
+
+.build-and-push-docker-image:
+  image: 
+    name: $PIPELINE_COE_REGISTRY/kaniko-container:latest
+    entrypoint: [""]
+  # tags: 
+  #   - ship_docker
+  variables:
+    DOCKERFILE_PATH: "./"
+    DOCKERFILE_NAME: "Dockerfile"
+    DIGESTFILE_NAME: "$CI_PROJECT_DIR/digest"
+    OPTS: ""
+  script:
+    - export VARIABLE_NAME=DOCKER_TARGET_REGISTRY
+    - !reference [.check-variable-sh, script]
+    - export VARIABLE_NAME=DOCKER_TARGET_IMAGE
+    - !reference [.check-variable-sh, script]
+    - !reference [.check-docker-auth-config-sh, script]
+    - cp ~/.docker/config.json /kaniko/.docker/config.json
+    - if [ -z $DOCKERFILE_CONTEXT ]; then DOCKERFILE_CONTEXT="$DOCKERFILE_PATH" ; fi
+    - /kaniko/executor --context "$DOCKERFILE_CONTEXT" --dockerfile "$DOCKERFILE_PATH/$DOCKERFILE_NAME" --destination "$DOCKER_TARGET_REGISTRY/$DOCKER_TARGET_IMAGE" --digest-file "$DIGESTFILE_NAME" $OPTS
+  artifacts:
+    paths: 
+      - $DIGESTFILE_NAME
+    expire_in: 1 week
+
+# -----
+# Include these variables in your .gitlab-ci.yml 
+# i.e.
+# variables:
+#   DOCKERFILE_PATH: "./" # (Optional)
+#   DOCKERFILE_CONTEXT: "./" # (Optional)
+#   DOCKERFILE_NAME: "Dockerfile" # (Optional)
+#   OPTS: "" # (Optional)
+#   OUTPUT_IMAGE_TAR: "" # (Optional)
+
+.build-docker-image:
+  image: 
+    name: $PIPELINE_COE_REGISTRY/kaniko-container:latest
+    entrypoint: [""]
+  # tags: 
+  #   - ship_docker
+  variables:
+    DOCKERFILE_PATH: "./"
+    DOCKERFILE_NAME: "Dockerfile"
+    OPTS: ""
+    OUTPUT_IMAGE_TAR: "output.tar"
+  script:
+    - if [ -z $DOCKERFILE_CONTEXT ]; then DOCKERFILE_CONTEXT="$DOCKERFILE_PATH" ; fi
+    - /kaniko/executor --context "$DOCKERFILE_CONTEXT" --dockerfile "$DOCKERFILE_PATH/$DOCKERFILE_NAME" --no-push --destination output:latest --tarPath $OUTPUT_IMAGE_TAR $OPTS
+  artifacts:
+    paths:
+      - $OUTPUT_IMAGE_TAR
+    expire_in: 1 week
